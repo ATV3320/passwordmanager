@@ -12,8 +12,9 @@ import (
 	"fmt"
 	"io/ioutil"
 	"math/big"
+	mathrand "math/rand"
 	"os"
-	"strconv"
+	"time"
 	"unicode"
 
 	"golang.org/x/term"
@@ -28,97 +29,85 @@ type PasswordData struct {
 }
 
 func generatePassword(username, website string, length int, key []byte) (string, error) {
-	if length < 4 { // Minimum length to ensure uppercase, lowercase, digit, and symbol
-		fmt.Println("Password length must be at least 4")
-		return "", fmt.Errorf("password length too short")
+	if length < 8 { // Minimum length for security
+		return "", fmt.Errorf("password length must be at least 8 characters")
 	}
 
 	// Generate random bytes
 	randomBytes := make([]byte, 16)
 	_, err := rand.Read(randomBytes)
 	if err != nil {
-		fmt.Println("Error generating random bytes:", err)
-		return "", err
+		return "", fmt.Errorf("error generating random bytes: %v", err)
 	}
 
-	fullString := username + website + hex.EncodeToString(randomBytes)
+	// Create initial hash
 	h := sha256.New()
-
-	// Create a hash of the full string
-	h.Write([]byte(fullString))
+	h.Write([]byte(username + website + hex.EncodeToString(randomBytes)))
 	hash := h.Sum(nil)
 
-	// Extract alphanumeric characters from the hash
+	// Extract alphanumeric characters to reach desired length - 3
+	// (reserving space for required characters)
 	alphanum := ""
 	for _, ch := range hash {
 		if (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') {
 			alphanum += string(ch)
 		}
-		if len(alphanum) >= length-2 { // Reserve space for extra elements
+		if len(alphanum) >= length-3 {
 			break
 		}
 	}
+	alphanum = alphanum[:length-3] // Ensure exact length minus required characters
 
-	// Add a number in the middle of the string
-	lenstr := (len(username+website) + 149) % 100
-	middleIndex := len(alphanum) / 2
-	alphanum = alphanum[:middleIndex] + strconv.Itoa(lenstr) + alphanum[middleIndex:]
+	// Add required characters
+	// 1. Number
+	numbers := "0123456789"
+	numIndex, _ := rand.Int(rand.Reader, big.NewInt(int64(len(numbers))))
+	requiredNum := string(numbers[numIndex.Int64()])
 
-	// Ensure at least one uppercase and one lowercase letter
+	// 2. Symbol
+	symbols := "!@#$%^&*"
+	symIndex, _ := rand.Int(rand.Reader, big.NewInt(int64(len(symbols))))
+	requiredSymbol := string(symbols[symIndex.Int64()])
+
+	// 3. Uppercase letter if not present
 	hasUpper := false
-	hasLower := false
 	for _, ch := range alphanum {
 		if unicode.IsUpper(ch) {
 			hasUpper = true
-		}
-		if unicode.IsLower(ch) {
-			hasLower = true
-		}
-		if hasUpper && hasLower {
 			break
 		}
 	}
+	positions := mathrand.New(mathrand.NewSource(time.Now().UnixNano())).Perm(length)
+	// positions := rand.New(rand.NewSource(time.Now().UnixNano())).Perm(length)
+	// positions := rand.Perm(length)
+	result := make([]rune, length)
 
-	// Replace with username's first character if necessary
-	if len(username) > 0 {
-		firstChar := rune(username[0])
-		if !hasUpper && unicode.IsLetter(firstChar) {
-			alphanum = string(unicode.ToUpper(firstChar)) + alphanum[1:]
-			hasUpper = true
+	// Fill with base password
+	for i := 0; i < len(alphanum); i++ {
+		result[positions[i]] = rune(alphanum[i])
+	}
+
+	// Add required characters
+	result[positions[len(positions)-1]] = rune(requiredSymbol[0])
+	result[positions[len(positions)-2]] = rune(requiredNum[0])
+
+	if !hasUpper {
+		// Convert one lowercase to uppercase if no uppercase exists
+		for i, ch := range result {
+			if unicode.IsLower(ch) {
+				result[i] = unicode.ToUpper(ch)
+				break
+			}
 		}
-		if !hasLower && unicode.IsLetter(firstChar) {
-			alphanum = alphanum[:1] + string(unicode.ToLower(firstChar)) + alphanum[2:]
-			hasLower = true
-		}
 	}
 
-	// Add a random password-friendly symbol
-	symbols := []rune{'.', ',', '#', '!', '@', '$', '%', '^', '&', '*'}
-	randomIndex, err := rand.Int(rand.Reader, big.NewInt(int64(len(symbols))))
+	// Convert back to string
+	finalPassword := string(result)
+
+	// Encrypt the password
+	encryptedPassword, err := encryptPasswordWithAES(finalPassword, key)
 	if err != nil {
-		fmt.Println("Error generating random index:", err)
-		return "", err
-	}
-	randomSymbol := symbols[randomIndex.Int64()]
-
-	// Insert the symbol at the safe position
-	safePositionBigInt, err := rand.Int(rand.Reader, big.NewInt(int64(len(alphanum)-1)))
-	if err != nil {
-		fmt.Println("Error generating random index:", err)
-		return "", err
-	}
-	safePosition := int(safePositionBigInt.Int64())
-
-	if safePosition >= len(alphanum)-1 {
-		safePosition = len(alphanum) - 2 // Insert before the last character
-	}
-
-	alphanum = alphanum[:safePosition] + string(randomSymbol) + alphanum[safePosition+1:]
-
-	// Encrypt the password using AES
-	encryptedPassword, err := encryptPasswordWithAES(alphanum, key)
-	if err != nil {
-		return "", err
+		return "", fmt.Errorf("error encrypting password: %v", err)
 	}
 
 	return encryptedPassword, nil
@@ -209,35 +198,39 @@ func storePasswordData(filename string, username, website, password string, encr
 	return nil
 }
 
-func decryptPasswordWithAES(ciphertext, key []byte) (string, error) {
-	// Check the key length and ensure it's 16 bytes
-	if len(key) != aes.BlockSize {
-		return "", fmt.Errorf("invalid key length, must be %d bytes", aes.BlockSize)
+func decryptPasswordWithAES(hexCiphertext []byte, key []byte) (string, error) {
+	// Convert hex string to bytes
+	ciphertext := make([]byte, hex.DecodedLen(len(hexCiphertext)))
+	_, err := hex.Decode(ciphertext, hexCiphertext)
+	if err != nil {
+		return "", fmt.Errorf("error decoding hex: %v", err)
 	}
 
-	// Create AES cipher block
+	// Ensure key is 16 bytes
+	if len(key) > 16 {
+		key = key[:16]
+	} else if len(key) < 16 {
+		key = append(key, make([]byte, 16-len(key))...)
+	}
+
+	// Create cipher block
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return "", fmt.Errorf("error creating AES cipher block: %v", err)
+		return "", fmt.Errorf("error creating cipher block: %v", err)
 	}
 
-	// Decrypt the ciphertext using CBC mode
-	ciphertextCopy := make([]byte, len(ciphertext))
-	copy(ciphertextCopy, ciphertext)
-
-	// Create a CBC mode decrypter
+	// Create CBC decrypter
 	mode := cipher.NewCBCDecrypter(block, key[:aes.BlockSize])
+	plaintext := make([]byte, len(ciphertext))
+	mode.CryptBlocks(plaintext, ciphertext)
 
-	// Decrypt the ciphertext
-	mode.CryptBlocks(ciphertextCopy, ciphertextCopy)
-
-	// Remove the PKCS7 padding
-	plaintext, err := pkcs7Unpad(ciphertextCopy, aes.BlockSize)
+	// Remove padding
+	unpadded, err := pkcs7Unpad(plaintext, aes.BlockSize)
 	if err != nil {
 		return "", fmt.Errorf("error removing padding: %v", err)
 	}
 
-	return string(plaintext), nil
+	return string(unpadded), nil
 }
 
 func getHiddenInput(prompt string) ([]byte, error) {
@@ -353,16 +346,23 @@ func main() {
 
 	// Generate password and hash it
 	key := sha256.Sum256(masterPassword)
-	password, _ := generatePassword(*username, *website, *length, key[:])
-
-	// Store password data (encrypted)
-	err = storePasswordData(filename, *username, *website, password, true)
+	password, err := generatePassword(*username, *website, *length, key[:])
 	if err != nil {
-		fmt.Println("Error storing password:", err)
+		fmt.Printf("Error generating password: %v\n", err)
+		return
 	}
 
-	// Display the generated password
-	fmt.Printf("Generated Password: %s\n", password)
+	// Store password data
+	err = storePasswordData(filename, *username, *website, password, true)
+	if err != nil {
+		fmt.Printf("Error storing password: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Password generated and stored successfully.\n")
+	// if *showPassword {
+	// 	fmt.Printf("Generated password: %s\n", password)
+	// }
 }
 
 // func main() {
